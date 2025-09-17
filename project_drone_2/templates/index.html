@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Drone Control</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <style>
+        #map { height: 600px; width: 100%; }
+        #telemetry { margin-top: 12px; }
+        .controls { margin: 8px 0; }
+        .controls button { margin-right: 8px; margin-bottom: 6px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div class="controls" id="station-buttons">
+        <button id="clear">Clear</button>
+        <button id="fly">Fly (test goal)</button>
+        <button id="land">Land</button>
+        <button id="guided">Guided</button>
+    </div>
+
+    <div id="telemetry">
+        <p>Altitude: <span id="alt">N/A</span> m</p>
+        <p>Mode: <span id="mode">N/A</span></p>
+        <p>Velocity: <span id="velocity">N/A</span> m/s</p>
+        <p>Distance Traveled: <span id="distance">0</span> m</p>
+    </div>
+
+    <div id="point-info">
+        <p>Selected Points: None</p>
+    </div>
+
+    <script>
+        var socket = io();
+        var map = L.map('map').setView([10.8507304, 106.7712575], 18);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        var pathPolyline = null;
+        var droneMarker = null;
+        var homeMarker = null;
+        var jsonPathPolyline = null;
+        var flownPathPolyline = null;
+        var flownPath = [];
+        var gpsDataGlobal = null;
+        var selectedPoints = [];
+        var pointMarkers = [];
+
+        // helper: đổi màu theo index
+        function getColorForStation(idx) {
+            const colors = ['red','orange','blue','green','purple','brown','darkcyan','magenta'];
+            return colors[idx % colors.length];
+        }
+
+        // thêm markers & buttons cho mọi station
+        function addStationMarkers(gpsData) {
+            gpsDataGlobal = gpsData;
+            const controlsDiv = document.getElementById('station-buttons');
+
+            Object.keys(gpsData).forEach((stationName, idx) => {
+                const stationPoints = gpsData[stationName];
+                if (!stationPoints || !stationPoints.length) return;
+
+                // lấy điểm cuối làm marker
+                const last = stationPoints[stationPoints.length - 1];
+                const marker = L.marker([last.lat, last.lon], {
+                    icon: L.icon({ iconUrl: 'static/tracking.png', iconSize: [32,32], iconAnchor: [16,32] })
+                }).addTo(map).bindPopup(`Delivery ${stationName}`);
+
+                marker.on('click', function() {
+                    if (jsonPathPolyline) map.removeLayer(jsonPathPolyline);
+                    const jsonWaypoints = stationPoints.map(st => [st.lat, st.lon]);
+                    jsonPathPolyline = L.polyline(jsonWaypoints, {color: getColorForStation(idx), dashArray: '5,5'}).addTo(map);
+                    map.fitBounds(jsonPathPolyline.getBounds());
+                });
+
+                // tạo button cho station
+                const btn = document.createElement('button');
+                btn.innerText = `Start ${stationName}`;
+                btn.onclick = function() {
+                    fetch('/start_mission', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({station: stationName})
+                    }).then(res => res.json()).then(data => {
+                        console.log(`Start ${stationName} mission`, data);
+                    });
+                };
+                controlsDiv.appendChild(btn);
+            });
+        }
+
+        // chọn điểm thủ công
+        map.on('click', function(e) {
+            var lat = e.latlng.lat;
+            var lon = e.latlng.lng;
+            var pointNumber = selectedPoints.length + 1;
+            var point = {lat: lat, lon: lon, number: pointNumber};
+            selectedPoints.push(point);
+
+            var marker = L.marker([lat, lon], {
+                draggable: true,
+                icon: L.divIcon({
+                    className: 'custom-div-icon',
+                    html: `<div style='background-color: blue; color: white; border-radius: 50%; width: 24px; height: 24px; text-align: center; line-height: 24px;'>${pointNumber}</div>`,
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                })
+            }).addTo(map).bindPopup(`Point ${pointNumber}<br>Lat: ${lat.toFixed(6)}<br>Lon: ${lon.toFixed(6)}`);
+
+            marker.on('dragend', function(event) {
+                var newLatLng = event.target.getLatLng();
+                var idx = selectedPoints.findIndex(p => p.number === pointNumber);
+                if (idx !== -1) {
+                    selectedPoints[idx].lat = newLatLng.lat;
+                    selectedPoints[idx].lon = newLatLng.lng;
+                }
+                if (pathPolyline) map.removeLayer(pathPolyline);
+                pathPolyline = L.polyline(selectedPoints.map(p => [p.lat, p.lon]), {color: 'blue'}).addTo(map);
+                var pointsText = selectedPoints.map(p => 
+                    `Point ${p.number}: Lat ${p.lat.toFixed(6)}, Lon ${p.lon.toFixed(6)}`
+                ).join('<br>');
+                document.getElementById('point-info').innerHTML = pointsText;
+            });
+
+            pointMarkers.push(marker);
+
+            if (pathPolyline) map.removeLayer(pathPolyline);
+            pathPolyline = L.polyline(selectedPoints.map(p => [p.lat, p.lon]), {color: 'blue'}).addTo(map);
+
+            var pointsText = selectedPoints.map(p => 
+                `Point ${p.number}: Lat ${p.lat.toFixed(6)}, Lon ${p.lon.toFixed(6)}`
+            ).join('<br>');
+            document.getElementById('point-info').innerHTML = pointsText;
+        });
+
+        // load stations
+        fetch('/get_gps_stations')
+            .then(res => res.json())
+            .then(gpsData => addStationMarkers(gpsData))
+            .catch(err => console.error('Error loading GPS stations:', err));
+
+        // clear
+        document.getElementById('clear').onclick = function() {
+            if (pathPolyline) map.removeLayer(pathPolyline);
+            if (jsonPathPolyline) map.removeLayer(jsonPathPolyline);
+            if (flownPathPolyline) {
+                flownPath = [];
+                flownPathPolyline.setLatLngs([]);
+            }
+            selectedPoints = [];
+            pointMarkers.forEach(marker => map.removeLayer(marker));
+            pointMarkers = [];
+            document.getElementById('point-info').innerText = 'None';
+        };
+
+        document.getElementById('fly').onclick = function() {
+            flownPath = [];
+            if (flownPathPolyline) flownPathPolyline.setLatLngs([]);
+            fetch('/fly', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({lat: 10.8507304, lon: 106.7712575})
+            }).then(res => res.json()).then(data => {
+                console.log('Mission started (fly)', data);
+            });
+        };
+
+        document.getElementById('land').onclick = function() {
+            socket.emit('change_mode', {mode: 'LAND'});
+        };
+
+        document.getElementById('guided').onclick = function() {
+            socket.emit('change_mode', {mode: 'GUIDED'});
+        };
+
+        socket.on('telemetry', function(data) {
+            if (data.lat && data.lon) {
+                if (!droneMarker) {
+                    droneMarker = L.marker([data.lat, data.lon], {
+                        icon: L.icon({ iconUrl: 'static/drone.png', iconSize: [32,32], iconAnchor: [16,16] })
+                    }).addTo(map).bindPopup('Drone');
+                } else {
+                    droneMarker.setLatLng([data.lat, data.lon]);
+                }
+                if (!homeMarker) {
+                    homeMarker = L.marker([data.lat, data.lon], {
+                        icon: L.icon({ iconUrl: 'static/home.png', iconSize: [32,32], iconAnchor: [16,32] })
+                    }).addTo(map).bindPopup('Home');
+                }
+                flownPath.push([data.lat, data.lon]);
+                if (!flownPathPolyline) {
+                    flownPathPolyline = L.polyline(flownPath, {color: 'red'}).addTo(map);
+                } else {
+                    flownPathPolyline.setLatLngs(flownPath);
+                }
+            }
+            document.getElementById('alt').innerText = data.alt !== undefined ? data.alt.toFixed(2) : 'N/A';
+            document.getElementById('mode').innerText = data.mode || 'N/A';
+            document.getElementById('velocity').innerText = data.velocity !== undefined ? data.velocity.toFixed(2) : 'N/A';
+            document.getElementById('distance').innerText = data.distance_traveled !== undefined ? data.distance_traveled.toFixed(2) : '0';
+        });
+
+        socket.on('planned_path', function(data) {
+            if (pathPolyline) map.removeLayer(pathPolyline);
+            pathPolyline = L.polyline(data.waypoints, {color: 'blue'}).addTo(map);
+            map.fitBounds(pathPolyline.getBounds());
+        });
+
+        socket.on('mission_status', function(data) {
+            console.log('Mission status:', data);
+            if (data.status === 'completed') {
+                alert('Mission completed!');
+            } else if (data.status === 'error') {
+                alert('Error: ' + data.error);
+            }
+        });
+    </script>
+</body>
+</html>
