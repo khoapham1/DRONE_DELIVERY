@@ -1,4 +1,4 @@
-# server.py (updated to support selected points)
+# server.py (updated to support ArUco markers display)
 from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 import threading, time
@@ -18,6 +18,9 @@ controller = get_controller(connection_str='tcp:127.0.0.1:5763', takeoff_height=
 # Theo dõi distance traveled (tích lũy)
 prev_loc = None
 distance_traveled = 0.0
+
+# Lưu trữ thông tin ArUco markers
+aruco_markers = {}
 
 def telemetry_loop():
     global prev_loc, distance_traveled
@@ -48,6 +51,32 @@ def telemetry_loop():
         except Exception as e:
             socketio.emit('telemetry', {'error': str(e)})
         time.sleep(0.5)
+
+# Endpoint để cập nhật ArUco markers từ drone
+@app.route('/update_aruco_markers', methods=['POST'])
+def update_aruco_markers():
+    try:
+        payload = request.get_json(silent=True) or {}
+        markers = payload.get('markers', {})
+        
+        print(f"Received ArUco markers: {markers}")  # Debug log
+        
+        # Cập nhật markers toàn cục
+        global aruco_markers
+        aruco_markers.update(markers)
+        
+        # Gửi realtime đến tất cả clients
+        socketio.emit('aruco_markers_update', {'markers': aruco_markers})
+        
+        return jsonify({'status': 'success', 'markers_received': len(markers)})
+    except Exception as e:
+        print(f"Error updating ArUco markers: {e}")  # Debug log
+        return jsonify({'error': str(e)}), 500
+
+# Endpoint để lấy danh sách ArUco markers hiện tại
+@app.route('/get_aruco_markers', methods=['GET'])
+def get_aruco_markers():
+    return jsonify(aruco_markers)
 
 @app.route('/get_gps_stations', methods=['GET'])
 def get_gps_stations():
@@ -139,7 +168,7 @@ def run_mission_in_thread(waypoints):
     def mission():
         try:
             socketio.emit('mission_status', {'status': 'starting', 'waypoints': waypoints})
-            controller.fly_and_precision_land_with_waypoints(waypoints, loiter_alt=3, aruco_duration=60)
+            controller.fly_and_precision_land_with_waypoints(waypoints, loiter_alt=2, aruco_duration=60)
             socketio.emit('mission_status', {'status': 'completed'})
         except Exception as e:
             socketio.emit('mission_status', {'status': 'error', 'error': str(e)})
@@ -150,6 +179,14 @@ def run_mission_in_thread(waypoints):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/clear_aruco_markers', methods=['POST'])
+def clear_aruco_markers():
+    global aruco_markers
+    aruco_markers = {}
+    socketio.emit('aruco_markers_update', {'markers': aruco_markers})
+    return jsonify({'status': 'cleared'})
+
 
 @app.route('/fly', methods=['POST'])
 def fly_route():

@@ -51,6 +51,15 @@
             border-radius: 4px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
+        .aruco-marker {
+            background-color: #ff6b6b;
+            border: 2px solid white;
+            border-radius: 50%;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+            line-height: 24px;
+        }
     </style>
 </head>
 <body>
@@ -63,6 +72,7 @@
         <button id="land">Land</button>
         <button id="guided">Guided</button>
         <button id="return-home">Return Home</button>
+        <button id="clear-aruco">Clear ArUco Markers</button>
     </div>
 
     <div class="info-panel">
@@ -77,6 +87,9 @@
         </div>
         <div class="info-item">
             <p>Distance: <span id="distance">0</span> m</p>
+        </div>
+        <div class="info-item">
+            <p>ArUco Markers: <span id="aruco-count">0</span> detected</p>
         </div>
     </div>
 
@@ -118,7 +131,6 @@
             "Esri WorldImagery": esriSat
         }).addTo(map);
 
-
         var pathPolyline = null;
         var droneMarker = null;
         var homeMarker = null;
@@ -128,11 +140,39 @@
         var gpsDataGlobal = null;
         var selectedPoints = [];
         var pointMarkers = [];
+        var arucoMarkers = {}; // Lưu trữ ArUco markers
+        var arucoLayer = L.layerGroup().addTo(map); // Layer group cho ArUco markers
 
         // helper: đổi màu theo index
         function getColorForStation(idx) {
             const colors = ['red','orange','blue','green','purple','brown','darkcyan','magenta'];
             return colors[idx % colors.length];
+        }
+
+        // Hàm hiển thị ArUco markers trên bản đồ
+        function updateArucoMarkers(markersData) {
+            // Xóa markers cũ
+            arucoLayer.clearLayers();
+            arucoMarkers = {};
+            
+            // Thêm markers mới
+            for (const [markerId, coords] of Object.entries(markersData)) {
+                if (coords && coords.length === 2) {
+                    const marker = L.marker([coords[0], coords[1]], {
+                        icon: L.divIcon({
+                            className: 'aruco-marker',
+                            html: `<div style="background-color: #ff6b6b; color: white; border-radius: 50%; width: 24px; height: 24px; text-align: center; line-height: 24px; font-weight: bold;">${markerId}</div>`,
+                            iconSize: [10, 10],
+                            iconAnchor: [12, 12]
+                        })
+                    }).addTo(arucoLayer).bindPopup(`ArUco Marker ID: ${markerId}<br>Lat: ${coords[0].toFixed(6)}<br>Lon: ${coords[1].toFixed(6)}`);
+                    
+                    arucoMarkers[markerId] = marker;
+                }
+            }
+            
+            // Cập nhật số lượng markers
+            document.getElementById('aruco-count').textContent = Object.keys(markersData).length;
         }
 
         // thêm markers & buttons cho mọi station
@@ -237,6 +277,19 @@
             document.getElementById('point-info').innerText = 'None';
         };
 
+        // clear ArUco markers
+        document.getElementById('clear-aruco').onclick = function() {
+            arucoLayer.clearLayers();
+            arucoMarkers = {};
+            document.getElementById('aruco-count').textContent = '0';
+            // Gửi yêu cầu xóa markers trên server
+            fetch('/update_aruco_markers', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({markers: {}})
+            });
+        };
+
         document.getElementById('fly').onclick = function() {
             flownPath = [];
             if (flownPathPolyline) flownPathPolyline.setLatLngs([]);
@@ -286,6 +339,47 @@
                 console.log('Returning home', data);
             });
         };
+
+        // Lắng nghe sự kiện cập nhật ArUco markers từ server
+        socket.on('aruco_markers_update', function(data) {
+            console.log('Received ArUco markers:', data.markers); // Debug log
+            updateArucoMarkers(data.markers);
+        });
+
+        // Hàm hiển thị ArUco markers trên bản đồ
+        function updateArucoMarkers(markersData) {
+            console.log('Updating ArUco markers:', markersData); // Debug log
+            
+            // Xóa markers cũ
+            arucoLayer.clearLayers();
+            arucoMarkers = {};
+            
+            // Thêm markers mới
+            for (const [markerId, coords] of Object.entries(markersData)) {
+                if (coords && coords.length === 2) {
+                    const marker = L.marker([coords[0], coords[1]], {
+                        icon: L.divIcon({
+                            className: 'aruco-marker',
+                            html: `<div style="background-color: #ff6b6b; color: white; border-radius: 50%; width: 24px; height: 24px; text-align: center; line-height: 24px; font-weight: bold;">${markerId}</div>`,
+                            iconSize: [24, 24],
+                            iconAnchor: [12, 12]
+                        })
+                    }).addTo(arucoLayer).bindPopup(`ArUco Marker ID: ${markerId}<br>Lat: ${coords[0].toFixed(6)}<br>Lon: ${coords[1].toFixed(6)}`);
+                    
+                    arucoMarkers[markerId] = marker;
+                    console.log(`Added marker ${markerId} at ${coords[0]}, ${coords[1]}`); // Debug log
+                }
+            }
+            
+            // Cập nhật số lượng markers
+            document.getElementById('aruco-count').textContent = Object.keys(markersData).length;
+        }
+
+        // Tải markers hiện có khi trang web được load
+        fetch('/get_aruco_markers')
+            .then(res => res.json())
+            .then(markers => updateArucoMarkers(markers))
+            .catch(err => console.error('Error loading ArUco markers:', err));
 
         socket.on('telemetry', function(data) {
             if (data.lat && data.lon) {

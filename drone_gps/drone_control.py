@@ -3,6 +3,7 @@
 import time
 import math
 import threading
+from matplotlib import markers
 import numpy as np
 
 import rclpy
@@ -13,6 +14,7 @@ from cv_bridge import CvBridge
 from dronekit import connect, VehicleMode, LocationGlobalRelative
 from pymavlink import mavutil
 from rclpy.executors import SingleThreadedExecutor
+import requests
 
 # ---- camera / aruco params (copy from yours) ---
 aruco = cv2.aruco
@@ -26,7 +28,6 @@ marker_heights = [10, 3]         # m, altitude thresholds
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 parameters = aruco.DetectorParameters_create()
 
-# Tuning detector parameters for robustness
 parameters.adaptiveThreshWinSizeMin = 3
 parameters.adaptiveThreshWinSizeMax = 23
 parameters.adaptiveThreshWinSizeStep = 10
@@ -56,6 +57,7 @@ np_dist_coeff = np.array(dist_coeff)
 time_to_wait = 0.1
 time_last = 0
 
+
 # ---- DroneController class ----
 
 class DroneController:
@@ -83,7 +85,19 @@ class DroneController:
         self.executor = None
         self.scan_thread = None
         self.scan_running = False
-
+    
+    def send_aruco_marker_to_server(self, markers):
+        """
+        Send detected ArUco markers to server endpoint.
+        """
+        try:
+            response = requests.post('http://localhost:5000/update_aruco_markers', json={'markers': markers}, timeout=2)
+            if response.status_code == 200:
+                print("Successfully sent ArUco markers to server")
+            else:
+                print(f"Failed to send ArUco markers, status code: {response.status_code}") 
+        except Exception as e:
+            print(f"Error sending ArUco markers to server: {e}")
     # MAVLink helpers
     def send_local_ned_velocity(self, vx, vy, vz):
         msg = self.vehicle.message_factory.set_position_target_local_ned_encode(
@@ -106,18 +120,32 @@ class DroneController:
         self.vehicle.send_mavlink(msg)
         self.vehicle.flush()
 
+    def set_speed(self, speed):
+        msg = self.vehicle.message_factory.command_long_encode(
+            0, 0, 
+            mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            0,
+            1,
+            speed,
+            -1, 0, 0, 0, 0 
+        )
+        self.vehicle.send_mavlink(msg)
+        self.vehicle.flush()
+        print(f"Set speed to {speed} m/s")
+
     # Core flight primitives
     def get_distance_meters(self, targetLocation, currentLocation):
         dLat = targetLocation.lat - currentLocation.lat
         dLon = targetLocation.lon - currentLocation.lon
         return math.sqrt((dLon * dLon) + (dLat * dLat)) * 1.113195e5
 
-    def goto(self, targetLocation, tolerance=4.0, timeout=60):
+    def goto(self, targetLocation, tolerance=2.0, timeout=60, speed=1.0):
         """
         Goto with increased tolerance and timeout to avoid stuck, record position.
         """
         distanceToTargetLocation = self.get_distance_meters(targetLocation, self.vehicle.location.global_relative_frame)
-        self.vehicle.simple_goto(targetLocation)
+        self.set_speed(speed)
+        self.vehicle.simple_goto(targetLocation, groundspeed=speed)
         start_dist = distanceToTargetLocation
         start_time = time.time()
         while self.vehicle.mode.name == "GUIDED" and time.time() - start_time < timeout:
@@ -126,7 +154,7 @@ class DroneController:
             current_pos = self.vehicle.location.global_relative_frame
             if current_pos.lat and current_pos.lon:
                 self.flown_path.append([current_pos.lat, current_pos.lon])
-            print(f"Distance to target: {currentDistance:.2f}m (threshold: {max(tolerance, start_dist * 0.01):.2f}m)")
+            #print(f"Distance to target: {currentDistance:.2f}m (threshold: {max(tolerance, start_dist * 0.01):.2f}m)")
             if currentDistance < max(tolerance, start_dist * 0.01):
                 print("Reached target waypoint")
                 return True
@@ -147,7 +175,6 @@ class DroneController:
             print('Arming...')
             time.sleep(1)
         self.vehicle.simple_takeoff(targetHeight)
-        # start_time = time.time()
         while True:
             alt = self.vehicle.location.global_relative_frame.alt
 
@@ -293,6 +320,7 @@ class DroneController:
             wp_loc = LocationGlobalRelative(wp[0], wp[1], loiter_alt)
             print(f"Flying back to waypoint {i+1}: {wp[0]}, {wp[1]}")
             self.goto(wp_loc)
+        self.goto(wp_home)
 
         # Final LAND at home
         print("Starting precision landing phase at home (aruco)...")
@@ -360,6 +388,8 @@ class DroneNode(Node):
         self.detected_marker = {}
         # image preprocessing helpers
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        self.last_marker_send_time = 0.0
+        self.marker_send_interval = 2.0  # seconds
 
     def preprocess(self, gray_img):
         """
@@ -478,7 +508,13 @@ class DroneNode(Node):
                                 lon = self.vehicle.location.global_relative_frame.lon
                                 self.detected_marker[marker_id] = [lat, lon]
                                 print(f"Detected marker ID {marker_id} at lat={lat:.6f}, lon={lon:.6f}")
-                    
+
+                                try:
+                                    self.controller.send_aruco_marker_to_server(self.detected_marker)
+                                except Exception as e:
+                                    print("Error sending ArUco marker:", e)
+
+                                
 
                 # Draw all detected markers
                 if corners:
